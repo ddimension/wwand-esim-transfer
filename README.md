@@ -104,13 +104,27 @@ builds with the same ucode:
 - the card helper against a scripted APDU host;
 - the plugin engine against a fake card.
 
-## Not verified on hardware yet
+## Hardware (2026-11-21)
 
-- Does each modem backend open a logical channel to the USIM by its partial
-  AID (`A0000000871002`)? The TS.43 EAP-AKA depends on it.
-- Which TS.43 servers accept a router. Telekom first.
-- Several `Set-Cookie` headers: uclient keeps only the last one
-  (`esim_transfer/http.uc`).
+- **USIM for EAP-AKA:** logical channel by the partial USIM AID, EF_AD,
+  AUTHENTICATE:
+  - NR7101, RG502Q-EA, over **AT** (`AT+CCHO`);
+  - Chateau, RG650E-EU, over **QMI UIM**: a physical SIM and an eSIM profile.
+- **Telekom** (`entitlement.telekom.de:4443`, from the operator list):
+  - EAP-AKA accepted with the server's AT_MAC verified;
+  - token;
+  - CheckEligibility answered "not eligible" for that number ("nicht für
+    einen Transfer freigeschaltet").
+- **Vodafone DE** (`es-de.vodafone.com:5445`, POST + JSON, behind Imperva):
+  - EAP-AKA accepted once all four cookies came back (curl transport);
+  - token;
+  - CheckEligibility `PrimaryAppEligibility=0` for a prepaid eSIM profile
+    with the router's own identity.
+
+Not yet:
+- a transfer past CheckEligibility;
+- discovery and the release's `notify seq` on an eUICC;
+- physical SIM → eSIM on a one-executor modem (see docs/STATUS.md).
 
 ## License
 

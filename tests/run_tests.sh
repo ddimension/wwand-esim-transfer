@@ -66,6 +66,7 @@ for variant in source bytecode; do
 	fi
 
 	export ESIM_TRANSFER_CARD="$ROOT/libexec/esim-transfer-card"
+	export FAKE_CURL="$TESTDIR/fake-curl"
 	export ESIM_TRANSFER_UCODE="$UCODE -L '$MODPATH' -L '$OVL/*.uc'"
 
 	for t in "$TESTDIR"/test_*.uc; do

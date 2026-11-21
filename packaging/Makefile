@@ -46,6 +46,11 @@ CMAKE_OPTIONS += \
 	-DUCODE_PRECOMPILE=$(if $(CONFIG_WWAND_UCODE_SOURCE),OFF,ON)
 
 OUT:=$(CMAKE_BINARY_DIR)/out
+
+# the CMakeLists has no install rules: the files are taken from $(OUT) by
+# the install sections below, so cmake.mk's default `install` target (ninja
+# refuses an unknown target) must not run
+Build/Install:=
 UCDIR:=/usr/share/ucode/wwand
 
 # read from ucode's Makefile exactly as the wwand Makefile does (see there)
@@ -61,10 +66,10 @@ define Package/wwand-esim-transfer
   CATEGORY:=Network
   SUBMENU:=WWAN
   TITLE:=eSIM transfer for wwand (release, import, GSMA TS.43)
-  # wwand-esim: modem_esim, the stdio APDU bridge and lpac; uclient: the
-  # TS.43 HTTPS client (with a ustream-ssl provider, which the default image
-  # has)
-  DEPENDS:=+wwand-esim +ucode-mod-uclient
+  # wwand-esim: modem_esim, the stdio APDU bridge and lpac; wwand-lpac-curl:
+  # the TS.43 HTTPS client's transport — a curl that returns every
+  # Set-Cookie (esim_transfer/http.uc says why uclient is not enough)
+  DEPENDS:=+wwand-esim +wwand-lpac-curl
   EXTRA_DEPENDS:=$(if $(UCODE_BUILT),ucode (>=$(UCODE_BUILT))$(if $(UCODE_ABI),$(comma) libucode$(UCODE_ABI) (>=$(UCODE_BUILT))))
   PKGARCH:=all
 endef

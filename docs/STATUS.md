@@ -71,10 +71,36 @@ Host tests: 4 suites × source/bytecode, all green
   - install without a ProfileIccid;
   - `\s` in brackets (cookie parser).
 
+## Hardware, Chateau (2026-11-21)
+
+RG650E-EU, QMI; slot 1 physical Telekom SIM, slot 2 eUICC with a Vodafone
+prepaid profile.
+- **Telekom:** login (strict AT_MAC) and token; CheckEligibility refuses
+  that number ("nicht für einen Transfer freigeschaltet").
+- **Vodafone DE:** login only with the curl transport (Imperva sets four
+  cookies, uclient keeps one → relay 400); token; CheckEligibility
+  `PrimaryAppEligibility=0`. Probably the device identity: Vodafone names
+  phone models, and we are honest.
+- **Conversion check** with the physical SIM active: the eUICC in slot 2 was
+  found through the slot list.
+- **Bugs found on the device and fixed:**
+  - no /etc/wwand → no state directory, writes lost silently;
+  - transfer type by source;
+  - uclient's cookies → curl transport (wwand-lpac-curl);
+  - the event field `gid1` (NR7101).
+- **Restored:**
+  - slot 2 active, wwand0 + wwims CONNECTED;
+  - the temporary uclient.so and curl removed;
+  - plugin and LuCI page remain (additive);
+  - /etc/wwand/esim-transfer/carriers.json remains.
+- **Config note:** the Chateau has `option sim_slot '1'`, but slot 2 was
+  active. Every wwand restart switches it to slot 1.
+
 ## Open
 
-1. HW on the Chateau (eSIM profile on 262 02): eligibility and API — needs
-   Vodafone's entitlement server URL and ucode-mod-uclient.
+1. A transfer past CheckEligibility: needs a subscription the operator
+   enables (the two numbers tried are refused); whether Vodafone accepts a
+   router identity is open.
 2. HW: discovery, release + notify seq (only with a profile that may be
    deleted!), meta.
 3. The feed commit (wwand-esim-transfer/Makefile) is on feed main, not

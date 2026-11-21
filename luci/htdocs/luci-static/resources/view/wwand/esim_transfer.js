@@ -53,6 +53,7 @@ var CHECK_LABELS = {
 	euicc: _('eUICC on this router'),
 	usim: _('USIM reachable for AUTHENTICATE'),
 	server: _('Entitlement server known'),
+	source: _('Source SIM and transfer type'),
 	prepare: _('Preparation'),
 	login: _('Login at the operator (EAP-AKA)'),
 	eligible: _('Operator allows the transfer'),
@@ -205,6 +206,17 @@ return view.extend({
 					E('span', { 'style': (k.verdict == 'possible') ? 'color:#2a2' : 'color:#c22' }, [ k.verdict ]),
 					' (' + hhmmss(k.finished) + ')' ]));
 		}
+
+		/* where the entitlement servers come from: the fetched operator list */
+		var c = m.st.carriers || {};
+		body.push(E('p', {}, [
+			c.count ? _('Operator list: %d records (%s, fetched %s).').format(c.count, c.label || '?', c.fetched ? new Date(c.fetched * 1000).toISOString().substr(0, 16).replace('T', ' ') : '?')
+			        : _('No operator list yet: without it (or option esim_transfer_server) no entitlement server is known.'),
+			' ',
+			E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(this, function() {
+				return self.run(plugin(m.modem, 'carriers_update'), _('Operator list updated.'));
+			}) }, c.count ? _('Update list') : _('Fetch list')),
+		]));
 
 		body.push(E('button', { 'class': 'btn cbi-button cbi-button-action', 'disabled': (k && k.running) ? true : null,
 			'click': ui.createHandlerFn(this, function() { return self.run(plugin(m.modem, 'check')); }) },

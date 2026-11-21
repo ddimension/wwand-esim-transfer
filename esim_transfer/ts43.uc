@@ -329,8 +329,12 @@ function session(c, fx, on)
 			for (let one in ((type(v) == 'array') ? v : [ v ])) {
 				let m = match(one ?? '', /^[[:space:]]*([^=;[:space:]]+)=([^;]*)/);
 
-				if (m)
+				if (m) {
 					st.cookies[m[1]] = m[2];
+					// the NAME only: which session the server keeps is what a
+					// failed relay is debugged by, its value is a credential
+					fx.log('debug', sprintf('ts43: cookie %s set', m[1]));
+				}
 			}
 		}
 	};
@@ -445,14 +449,21 @@ function session(c, fx, on)
 			if (length(st.cookies))
 				headers.Cookie = cookie_header();
 
+			fx.log('debug', sprintf('ts43: → POST EAP relay (%d bytes EAP, cookies: %s)', length(bytes),
+				length(st.cookies) ? join(', ', keys(st.cookies)) : 'none'));
+
 			fx.http({ method: 'POST', url: split(c.server, '?')[0], headers: headers,
 			          body: sprintf('{"eap-relay-packet":"%s"}', b64enc(chr(...bytes))) }, (err, r2) => {
 				if (st.cancelled)
 					return;
 
-				if (err)
+				if (err) {
+					fx.log('debug', sprintf('ts43: ← EAP relay: transport error %J', err));
 					return cb(err);
+				}
 
+				fx.log('debug', sprintf('ts43: ← EAP relay: HTTP %d, %d bytes%s', r2.status, length(r2.body ?? ''),
+					(r2.status < 200 || r2.status > 299) ? ': ' + snippet(r2.body) : ''));
 				take_cookies(r2.headers);
 				then(r2);
 			});

@@ -43,6 +43,18 @@ const CARD = '/usr/libexec/wwand/esim-transfer-card';
 const STATE_DIR = '/etc/wwand/esim-transfer';
 const ENTITLEMENT_FILE = STATE_DIR + '/entitlement.json';
 
+// The operator list fetched on request (`wwandctl transfer carriers update`):
+// NekokoLPA2's entitlement.json (github.com/iebb/NekokoLPA2, MIT;
+// assets/ts43/entitlement.json, the record format of damonto/ts43-go), which
+// its authors derived from Google's carrier configurations. Not shipped in
+// the package — fetched by the user, from a PINNED commit, so what a router
+// uses is a known list and an upstream change reaches it only when this pin
+// moves (option esim_transfer_carriers_url overrides). Its data needs
+// checking like any third-party list: it files 262 03 (o2) as "1&1"
+// (read 2026-11-21).
+const CARRIERS_FILE = STATE_DIR + '/carriers.json';
+const CARRIERS_URL = 'https://raw.githubusercontent.com/iebb/NekokoLPA2/8c57763fd720ce342a63cbd2a34335b84f516ebb/assets/ts43/entitlement.json';
+
 // lines of debug trace kept per modem (engine trace)
 const TRACE_MAX = 200;
 
@@ -51,7 +63,7 @@ const TS43_IDLE = [ 'done', 'denied', 'error', 'cancelled', 'download', 'eligibl
 
 const OPTIONS = [ 'esim_transfer_server', 'esim_transfer_post', 'esim_transfer_type',
 	'esim_transfer_vendor', 'esim_transfer_model', 'esim_transfer_sw', 'esim_transfer_app_name',
-	'esim_transfer_mnc_len', 'esim_transfer_lax_mac', 'esim_transfer_smds' ];
+	'esim_transfer_mnc_len', 'esim_transfer_lax_mac', 'esim_transfer_smds', 'esim_transfer_carriers_url' ];
 
 // seconds; overridable through deps.timing for the tests
 const TIMING = {
@@ -85,6 +97,7 @@ function cfg_of(ext)
 		mnc_len: n(ext?.esim_transfer_mnc_len),
 		lax_mac: truthy(ext?.esim_transfer_lax_mac),
 		smds: str(ext?.esim_transfer_smds),
+		carriers_url: str(ext?.esim_transfer_carriers_url),
 	};
 }
 
@@ -129,6 +142,26 @@ let iccid_eq = (a, b) => type(a) == 'string' && type(b) == 'string' &&
 let delete_seqs = (list, iccid) => map(filter(list, (n) =>
 	n.profileManagementOperation == 'delete' && iccid_eq(n.iccid, iccid) && n.seqNumber != null), (n) => n.seqNumber);
 
+// An operator list as the plugin keeps it: the records a non-Samsung client
+// can use. `channel: samsung` records describe Samsung's own request format
+// (NekokoLPA2 lib/ts43/samsung_request.dart), which this client does not
+// speak; a record without an https server or a numeric MCC+MNC is dropped.
+// { records } or { error }.
+function carriers_of(text)
+{
+	let a = null;
+
+	try { a = json(text ?? ''); } catch (e) { return { error: 'not JSON' }; }
+
+	if (type(a) != 'array')
+		return { error: 'not a list of records' };
+
+	let recs = filter(a, (r) => type(r) == 'object' && match('' + (r.mccmnc ?? ''), /^[0-9]{5,6}$/) &&
+		match(r.entitlementServer ?? '', /^https:\/\/[A-Za-z0-9.-]+/) && r.channel != 'samsung');
+
+	return length(recs) ? { records: recs } : { error: 'no usable record' };
+}
+
 let valid_iccid = (s) => type(s) == 'string' && match(s, /^[0-9]{18,20}F?$/);
 let valid_eid = (s) => type(s) == 'string' && match(s, /^[0-9]{32}$/);
 let valid_imei = (s) => type(s) == 'string' && match(s, /^[0-9]{14,16}$/);
@@ -136,8 +169,9 @@ let valid_imei = (s) => type(s) == 'string' && match(s, /^[0-9]{14,16}$/);
 // deps: {
 //   esim(ref, op, params, cb)        wwand's modem_esim (the guarded path)
 //   card(ref, args, cb)              one esim-transfer-card run → cb(err, payload)
-//   modem(ref)                       { imsi, iccid, imei, model, eid } (null: no modem)
+//   modem(ref)                       { imsi, iccid, imei, model, eid, profiles } (null: no modem)
 //   online(ref)                      the connection token, null while none
+//   slots(ref, cb), switch_slot(ref, physical, cb)   the modem's SIM slots (optional)
 //   http(req, cb), timer(ms, fn), now(), log(level, msg)
 //   read(path), write(path, text)    the state file and entitlement.json
 //   state_dir, timing
@@ -190,7 +224,10 @@ function engine(deps)
 			if (s.releases != null)
 				all[ref] = s.releases;
 
-		deps.write(dir + '/releases.json', sprintf('%J', all));
+		// the record is what tells, after a restart, which delete notification
+		// is still owed; losing it silently would end the retries unseen
+		if (!deps.write(dir + '/releases.json', sprintf('%J', all)))
+			deps.log('warning', sprintf('esim-transfer: cannot write %s/releases.json — releases will not survive a restart', dir));
 	};
 
 	// a release's progress, for the page and the CLI: one entry per step,
@@ -401,12 +438,74 @@ function engine(deps)
 
 	// --- TS.43 ----------------------------------------------------------------
 
+	// the fetched operator list, cached until an update replaces it
+	let carriers = null;
+
+	let carriers_file = () => {
+		if (carriers == null) {
+			let c = null;
+
+			try { c = json(deps.read(CARRIERS_FILE) ?? 'null'); } catch (e) { c = null; }
+
+			carriers = (type(c?.records) == 'array') ? c : { records: [] };
+		}
+
+		return carriers;
+	};
+
+	// The user's own entitlement.json first — it says what this user knows
+	// about their operator — then the fetched list. { record, reason, from }
 	let record_for = (sim) => {
 		let recs = null;
 
-		try { recs = json(deps.read(ENTITLEMENT_FILE) ?? '[]'); } catch (e) { recs = null; }
+		try { recs = json(deps.read(ENTITLEMENT_FILE) ?? 'null'); } catch (e) { recs = null; }
 
-		return ts43.pick_record(recs, sim);
+		if (type(recs) == 'array') {
+			let r = ts43.pick_record(recs, sim);
+
+			if (r.record || r.reason == 'ambiguous')
+				return { ...r, from: ENTITLEMENT_FILE };
+		}
+
+		let c = carriers_file();
+		let r = ts43.pick_record(c.records, sim);
+
+		return { ...r, from: length(c.records) ? sprintf('the operator list (%s)', c.label ?? 'fetched') : 'no operator list' };
+	};
+
+	// fetch, check and store the operator list (see CARRIERS_URL)
+	let carriers_update = (ref, cfg, cb) => {
+		let url = cfg.carriers_url ?? CARRIERS_URL;
+
+		trace(ref, 'carriers', 'fetching ' + url);
+
+		deps.http({ method: 'GET', url: url, headers: { 'Accept': 'application/json' } }, (err, res) => {
+			if (err || res?.status != 200) {
+				let why_ = err ? why(err) : sprintf('HTTP %d', res?.status ?? 0);
+
+				trace(ref, 'carriers', 'update failed: ' + why_);
+				return cb({ error: 'carriers_fetch', detail: why_ });
+			}
+
+			let c = carriers_of(res.body);
+
+			if (c.error) {
+				trace(ref, 'carriers', 'update refused: ' + c.error);
+				return cb({ error: 'carriers_invalid', detail: c.error });
+			}
+
+			let label = (url == CARRIERS_URL) ? 'NekokoLPA2 ' + substr(split(CARRIERS_URL, '/')[5], 0, 8) : url;
+			let doc = { source: url, label: label, fetched: deps.now(), records: c.records };
+
+			if (!deps.write(CARRIERS_FILE, sprintf('%J', doc))) {
+				trace(ref, 'carriers', 'cannot write ' + CARRIERS_FILE);
+				return cb({ error: 'carriers_write', detail: 'cannot write ' + CARRIERS_FILE });
+			}
+
+			carriers = doc;
+			trace(ref, 'carriers', sprintf('%d records stored (%s)', length(c.records), label));
+			cb(null, { count: length(c.records), fetched: doc.fetched, label: label });
+		});
 	};
 
 	// Everything a TS.43 session needs before its first request: the card's
@@ -431,19 +530,34 @@ function engine(deps)
 
 			let sim = { mccmnc: substr(m.imsi, 0, 3 + mnc_len), imsi: m.imsi, gid1: info.gid1 };
 			let rec = cfg.server ? { record: { entitlementServer: cfg.server, useHttpPost: cfg.post }, from: 'option' }
-			                     : { ...record_for(sim), from: ENTITLEMENT_FILE };
+			                     : record_for(sim);
 
 			info.mccmnc = sim.mccmnc;
 
 			if (!rec.record)
-				return cb({ error: 'no_entitlement_server', detail: sprintf('%s for %s: set option esim_transfer_server or add %s',
-					rec.reason, sim.mccmnc, ENTITLEMENT_FILE) }, null, info);
+				return cb({ error: 'no_entitlement_server', detail: sprintf('%s for %s in %s: fetch the operator list (`wwandctl transfer carriers update`), add %s, or set option esim_transfer_server',
+					rec.reason, sim.mccmnc, rec.from, ENTITLEMENT_FILE) }, null, info);
 
 			let r = rec.record;
 
 			info.server = r.entitlementServer;
 			info.server_from = rec.from;
 			trace(ref, 'ts43', sprintf('entitlement server %s (from %s)', r.entitlementServer, rec.from));
+
+			// The transfer type depends on what the SOURCE is: the record has
+			// one for a physical SIM and one for an eSIM profile, and an
+			// operator may support only one direction (ts43-go entitlement.go
+			// toEntitlement). The SIM in use is an eSIM profile when its
+			// ICCID is among the eUICC's profiles.
+			let esim_source = length(filter(m.profiles ?? [], (p) => iccid_eq(p.iccid, m.iccid))) > 0;
+			let supported = esim_source ? r.supportEsimToEsimTransfer : r.supportPsimToEsimTransfer;
+
+			info.source = esim_source ? 'esim' : 'psim';
+			info.transfer_type = cfg.type ?? +((esim_source ? r.transferTypeEsim : r.transferTypePsim) ?? 0);
+
+			if (supported === false)
+				return cb({ error: 'unsupported_source', detail: sprintf('the operator\'s record allows no transfer from a%s',
+					esim_source ? 'n eSIM profile' : ' physical SIM') }, null, info);
 
 			cb(null, {
 				server: r.entitlementServer, post: !!r.useHttpPost, app: r.app ?? 'ap2009',
@@ -453,12 +567,34 @@ function engine(deps)
 				terminal: { id: m.imei, vendor: cfg.vendor ?? 'OWRT', model: cfg.model ?? m.model ?? 'router',
 				            sw: cfg.sw ?? 'wwand-esim-transfer-' + VERSION },
 				imsi: m.imsi, mnc_len: mnc_len, source_iccid: m.iccid,
-				target: target, transfer_type: cfg.type ?? +(r.transferTypePsim ?? r.transferTypeEsim ?? 0),
+				target: target, transfer_type: info.transfer_type,
 				eligibility_target: !!r.setCheckEligibilityTargetTerminalId,
 				poll_interval: 60 * +(r.acquireConfigurationPollingIntervalMinutes ?? 0) || timing.poll_interval,
 				poll_timeout: 60 * +(r.acquireConfigurationPollingTimeoutMinutes ?? 0) || timing.poll_timeout,
 				lax_mac: cfg.lax_mac,
 			}, info);
+		});
+	};
+
+	// The router's eUICC, active or not: { eid, physical, active } or null.
+	// A one-executor modem reaches only the card in its active slot, so
+	// status() knows an EID only while the eUICC is the active card; the
+	// slot list names it from any slot (wwand modem_sim_slots, QMI GET SLOT
+	// STATUS — slot 2 of the Chateau's RG650E while its physical SIM is in
+	// use, 2026-11-21). That is the target of a physical SIM → eSIM move.
+	let euicc_of = (ref, cb) => {
+		let m = deps.modem(ref);
+
+		if (type(deps.slots) != 'function')
+			return cb(valid_eid(m?.eid) ? { eid: m.eid, physical: null, active: true } : null);
+
+		deps.slots(ref, (err, res) => {
+			let e = filter(res?.slots ?? [], (x) => x.is_euicc && valid_eid(x.eid))[0];
+
+			if (e)
+				return cb({ eid: e.eid, physical: e.physical, active: !!e.active });
+
+			cb(valid_eid(m?.eid) ? { eid: m.eid, physical: null, active: true } : null);
 		});
 	};
 
@@ -487,23 +623,27 @@ function engine(deps)
 			return cb({ error: 'no_sim', detail: 'the source SIM is not read yet' });
 
 		let target = args?.target ?? 'external';
-		let teid = (target == 'router') ? m.eid : args?.target_eid;
+
+		euicc_of(ref, (eu) => {
+		let teid = (target == 'router') ? eu?.eid : args?.target_eid;
 		let timei = (target == 'router') ? m.imei : args?.target_imei;
 
 		if (!valid_eid(teid))
-			return cb({ error: 'invalid_argument', detail: (target == 'router') ? 'this router has no eUICC EID' : 'target_eid' });
+			return cb({ error: 'invalid_argument', detail: (target == 'router') ? 'this router has no eUICC' : 'target_eid' });
 
 		if (!valid_imei(timei))
 			return cb({ error: 'invalid_argument', detail: 'target_imei' });
 
-		trace(ref, 'ts43', sprintf('transfer requested, target %s', target));
+		trace(ref, 'ts43', sprintf('transfer requested, target %s%s', target,
+			(target == 'router' && eu && !eu.active) ? sprintf(' (eUICC in slot %d, not active)', eu.physical) : ''));
 
 		prepare(ref, cfg, { eid: teid, imei: timei }, (err, c) => {
 			if (err)
 				return cb(err);
 
 			let t = { state: 'starting', target: target, target_eid: teid, server: c.server, events: [],
-			          started: deps.now(), result: null, prompt: null };
+			          started: deps.now(), result: null, prompt: null,
+			          euicc_slot: (target == 'router' && eu && !eu.active) ? eu.physical : null };
 
 			s.ts43 = t;
 
@@ -544,6 +684,7 @@ function engine(deps)
 			cb(null, { started: true, server: c.server, target: target });
 			t.session.start();
 		});
+		});
 	};
 
 	// "Is a transfer possible here?" — the pre-flight. Each step of the
@@ -581,11 +722,13 @@ function engine(deps)
 		}
 
 		item('sim', true, sprintf('IMSI %s…, ICCID %s…', substr(m.imsi, 0, 5), substr(m.iccid ?? '', 0, 7)));
-		item('euicc', valid_eid(m.eid) ? true : null, valid_eid(m.eid)
-			? sprintf('EID %s… — a profile can come onto this router', substr(m.eid, 0, 8))
-			: 'no eUICC in the active slot: a transfer can only target another device');
 
-		prepare(ref, cfg, { eid: m.eid, imei: m.imei }, (err, c, info) => {
+		euicc_of(ref, (eu) => {
+		item('euicc', eu ? true : null, !eu ? 'no eUICC on this modem: a transfer can only target another device'
+			: eu.active ? sprintf('EID %s… — a profile can come onto this router', substr(eu.eid, 0, 8))
+			: sprintf('EID %s… in slot %d (not active) — the install switches to it', substr(eu.eid, 0, 8), eu.physical));
+
+		prepare(ref, cfg, { eid: eu?.eid, imei: m.imei }, (err, c, info) => {
 			if (info?.usim === false) {
 				item('usim', false, 'the modem does not open a channel to the USIM');
 				return finish('not possible on this modem: the USIM cannot be reached for EAP-AKA');
@@ -599,6 +742,12 @@ function engine(deps)
 				return finish('MNC length unknown: set option esim_transfer_mnc_len');
 			}
 
+			if (err?.error == 'unsupported_source') {
+				item('server', true, sprintf('%s (from %s)', info.server, info.server_from));
+				item('source', false, err.detail);
+				return finish('the operator does not transfer from this kind of SIM');
+			}
+
 			if (err?.error == 'no_entitlement_server') {
 				item('server', false, err.detail);
 				return finish('no entitlement server known for this operator');
@@ -610,6 +759,8 @@ function engine(deps)
 			}
 
 			item('server', true, sprintf('%s (from %s)', info.server, info.server_from));
+			item('source', true, sprintf('%s, transfer type %d', (info.source == 'esim') ? 'eSIM profile' : 'physical SIM',
+				info.transfer_type));
 
 			let sess;
 			let seen_auth = false;
@@ -641,6 +792,7 @@ function engine(deps)
 			});
 			sess.start();
 		});
+		});
 	};
 
 	let ts43_view = (t) => t ? { state: t.state, target: t.target, target_eid: t.target_eid, server: t.server,
@@ -661,6 +813,40 @@ function engine(deps)
 		if (t?.state != 'download' || t.target != 'router')
 			return cb({ error: 'not_ready', detail: 'no activation code for this router yet' });
 
+		// on a one-executor modem the eUICC may sit in another slot: switch to
+		// it, then wait until its ISD-R answers (the card is re-read after a
+		// switch; wwand answers esim ops only once it is up)
+		let on_euicc = (go) => {
+			if (t.euicc_slot == null || type(deps.switch_slot) != 'function')
+				return go();
+
+			trace(ref, 'ts43', sprintf('install: switching to the eUICC in slot %d', t.euicc_slot));
+			push(t.events, { at: deps.now(), state: 'switching', reason: sprintf('slot %d', t.euicc_slot) });
+
+			deps.switch_slot(ref, t.euicc_slot, (err) => {
+				if (err)
+					return ts43_fail(ref, t, 'slot switch: ' + why(err));
+
+				let started = deps.now();
+				let wait;
+				wait = () => esim(ref, 'profiles')((e, r) => {
+					if (!e)
+						return go();
+
+					if (deps.now() - started > 90)
+						return ts43_fail(ref, t, 'the eUICC did not answer after the slot switch');
+
+					deps.timer(3000, wait);
+				});
+				wait();
+			});
+		};
+
+		cb(null, { installing: true, switching_to_slot: t.euicc_slot });
+		t.state = 'installing';
+		push(t.events, { at: deps.now(), state: 'installing' });
+
+		on_euicc(() => {
 		// the profiles before, so the new one is known even when the server
 		// named no ICCID (ProfileIccid is optional, TS.43 v13.0 DownloadInfo)
 		esim(ref, 'profiles')((e0, before) => {
@@ -670,11 +856,7 @@ function engine(deps)
 
 			esim(ref, 'download', { activation_code: t.result.activation_code })((err) => {
 				if (err)
-					return cb(err);
-
-				cb(null, { installing: true });
-				t.state = 'installing';
-				push(t.events, { at: deps.now(), state: 'installing' });
+					return ts43_fail(ref, t, 'download: ' + why(err));
 
 				let look;
 				look = () => esim(ref, 'download_status')((e2, ds) => {
@@ -698,6 +880,12 @@ function engine(deps)
 							if (e3)
 								return ts43_fail(ref, t, 'enable: ' + why(e3));
 
+							// the daemon asserts option sim_slot at every
+							// bring-up: left on the physical SIM's slot, the
+							// next restart would go back to it
+							if (t.euicc_slot != null)
+								trace(ref, 'ts43', sprintf('install: set option sim_slot \'%d\' on this modem, or a restart returns to the physical SIM', t.euicc_slot));
+
 							t.session.installed(iccid);
 						});
 					});
@@ -705,12 +893,14 @@ function engine(deps)
 				deps.timer(2000, look);
 			});
 		});
+		});
 	};
 
 	return {
 		release: release,
 		deliver: deliver,
 		check: check,
+		carriers_update: carriers_update,
 
 		discovery: (ref, cfg, cb) => {
 			trace(ref, 'discovery', sprintf('asking SM-DS %s', cfg.smds ?? 'lpa.ds.gsma.com (default)'));
@@ -825,6 +1015,8 @@ function engine(deps)
 				ts43: ts43_view(s.ts43),
 				check: s.check,
 				hint: hints.hint_for(m?.imsi),
+				carriers: { count: length(carriers_file().records), fetched: carriers_file().fetched,
+				            label: carriers_file().label },
 				now: deps.now(),
 			};
 		},
@@ -903,6 +1095,10 @@ const PLUGIN = {
 	options: OPTIONS,
 
 	create: function(pd) {
+		// fs.mkdir() makes one level: a router without /etc/wwand (no other
+		// plugin made it) would get no state directory at all, and every
+		// write into it would fail (HW-seen on the Chateau, 2026-11-21)
+		fs.mkdir('/etc/wwand');
 		fs.mkdir(STATE_DIR);
 
 		let eng = engine({
@@ -922,15 +1118,17 @@ const PLUGIN = {
 				let m = pd.modem_of(ref)?.modem;
 
 				return m ? { imsi: m.info?.imsi, iccid: m.info?.iccid, imei: m.info?.imei,
-				             model: m.info?.model, eid: m.esim_info?.eid } : null;
+				             model: m.info?.model, eid: m.esim_info?.eid, profiles: m.esim_info?.profiles } : null;
 			},
 			online: pd.connection_token,
+			slots: (ref, cb) => (type(pd.sim_slots) == 'function') ? pd.sim_slots(ref, cb) : cb({ error: 'unsupported' }),
+			switch_slot: (type(pd.sim_switch_slot) == 'function') ? pd.sim_switch_slot : null,
 			http: http.request,
 			timer: (ms, fn) => uloop.timer(ms, fn),
 			now: () => time(),
 			log: pd.log,
 			read: (p) => fs.readfile(p),
-			write: (p, t) => fs.writefile(p, t),
+			write: (p, t) => fs.writefile(p, t) != null,
 		});
 
 		let wrap = (fn) => (ref, ext, args, cb) => fn(ref, cfg_of(ext), args ?? {}, cb);
@@ -955,6 +1153,7 @@ const PLUGIN = {
 				meta: wrap((ref, cfg, a, cb) => eng.meta(ref, cb)),
 				usim_check: wrap((ref, cfg, a, cb) => eng.usim_check(ref, cb)),
 				check: wrap((ref, cfg, a, cb) => eng.check(ref, cfg, cb)),
+				carriers_update: wrap((ref, cfg, a, cb) => eng.carriers_update(ref, cfg, cb)),
 				log: (ref, ext, args, cb) => cb(null, { lines: eng.log(ref) }),
 				download_status: (ref, ext, args, cb) => eng.download_status(ref, cb),
 				ts43_start: wrap((ref, cfg, a, cb) => eng.ts43_start(ref, cfg, a, cb)),
@@ -970,4 +1169,4 @@ const PLUGIN = {
 	},
 };
 
-export { PLUGIN, engine, cfg_of, notifications_of, card_runner };
+export { PLUGIN, engine, cfg_of, notifications_of, carriers_of, card_runner };

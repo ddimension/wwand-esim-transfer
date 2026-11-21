@@ -109,6 +109,7 @@ const COMMAND = {
 		'transfer [modem] check                is a transfer possible? (TS.43 login + eligibility, orders nothing)',
 		'transfer [modem] usim                 can this modem reach the USIM for EAP-AKA (read-only probe)',
 		'transfer [modem] log                  the debug trace: every step, status word and server verdict',
+		'transfer [modem] carriers [update]    the operator list (TS.43 servers; NekokoLPA2), fetch it',
 		'transfer [modem] meta                 the card\'s profiles with their Device Change settings (SGP.22 v3)',
 		'transfer [modem] ts43 start --router  TS.43: move this SIM onto this router\'s eUICC',
 		'transfer [modem] ts43 start <eid> <imei>     TS.43: an activation code for another device',
@@ -201,6 +202,22 @@ const COMMAND = {
 			printf('\n%s\n', k?.running ? 'still running — `wwandctl transfer` shows the result'
 				: 'result: ' + (k?.verdict ?? '?'));
 			exit((k?.verdict == 'possible') ? 0 : 1);
+		}
+
+		// the operator list (NekokoLPA2's entitlement.json, fetched on request)
+		case 'carriers': {
+			if (rest[1] == 'update') {
+				let res = plugin_call(ctx, r.modem, 'carriers_update');
+
+				printf('%d operator records stored (%s)\n', res?.count ?? 0, res?.label ?? '?');
+				break;
+			}
+
+			let c = plugin_call(ctx, r.modem, 'status')?.carriers;
+
+			printf('%s\n', c?.count ? sprintf('%d operator records (%s, fetched %s)', c.count, c.label ?? '?', localtime_s(c.fetched))
+				: 'no operator list — `wwandctl transfer carriers update` fetches it');
+			break;
 		}
 
 		case 'log':

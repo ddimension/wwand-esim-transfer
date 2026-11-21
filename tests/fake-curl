@@ -1,0 +1,17 @@
+#!/bin/sh
+# A stand-in for curl in test_http.uc: records its arguments, writes a header
+# dump with a 100 Continue block and three Set-Cookie lines (as Imperva sends
+# them), and the request body back as the response body.
+hdr= out= data= prev=
+for a in "$@"; do
+	case "$prev" in
+		-D) hdr="$a" ;;
+		-o) out="$a" ;;
+		--data-binary) data="${a#@}" ;;
+	esac
+	prev="$a"
+done
+printf '%s\n' "$@" > "$0.args"   # the environment is not ours: next to us
+printf 'HTTP/1.1 100 Continue\r\n\r\nHTTP/2 400 \r\ncontent-type: text/plain\r\nset-cookie: visid_incap_1=AAA; path=/\r\nset-cookie: nlbi_1=BBB; path=/\r\nset-cookie: incap_ses_1=CCC; path=/\r\n\r\n' > "$hdr"
+if [ -n "$data" ]; then cat "$data" > "$out"; else printf 'no body' > "$out"; fi
+exit 0

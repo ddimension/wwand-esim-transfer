@@ -81,7 +81,7 @@ let eng_of = (extra) => P.engine({
 	now: () => clock,
 	log: () => null,
 	read: (p) => files[p],
-	write: (p, t) => { files[p] = t; },
+	write: (p, t) => { files[p] = t; return true; },
 	state_dir: '/st',
 });
 
@@ -301,8 +301,9 @@ eng = eng_of({ card: (ref, args, cb) => cb(null, { mnc_len: '2', group_id: '01' 
                http: (req, cb) => { push(check_reqs, req); cb(null, { status: 403, headers: {}, body: 'Forbidden' }); } });
 eng.check('m0', P.cfg_of({ esim_transfer_server: 'https://es.example/ts43' }), () => null);
 k = eng.status('m0').check;
-eq(item_ids(k), [ [ 'sim', true ], [ 'euicc', true ], [ 'usim', true ], [ 'server', true ], [ 'login', false ] ],
+eq(item_ids(k), [ [ 'sim', true ], [ 'euicc', true ], [ 'usim', true ], [ 'server', true ], [ 'source', true ], [ 'login', false ] ],
 	'check: server known, login refused');
+eq(k.items[4].detail, 'physical SIM, transfer type 0', 'check: a SIM not among the eUICC profiles is a physical one');
 eq(k.verdict, 'the server refused the login (it may not accept a router)', 'check: the likely reason');
 ok(length(filter(eng.log('m0'), (l) => l.area == 'ts43' && index(l.msg, 'HTTP 403') >= 0)), 'check: the HTTP status in the trace');
 
@@ -320,8 +321,163 @@ eng = eng_of({ card: (ref, args, cb) => cb(null, { mnc_len: '2', group_id: '01' 
 eng.check('m0', P.cfg_of({ esim_transfer_server: 'https://es.example/ts43' }), () => null);
 k = eng.status('m0').check;
 eq(k.verdict, 'possible', 'check: eligible -> possible');
-eq(item_ids(k)[5], [ 'eligible', true ], 'check: the eligibility item');
+eq(item_ids(k)[6], [ 'eligible', true ], 'check: the eligibility item');
 eq(ops_seen, [ 'CheckEligibility' ], 'check: nothing after CheckEligibility is sent');
+
+// the source is an eSIM profile: the record's eSIM transfer type, and its gate
+let recfile = sprintf('%J', [ { mccmnc: '26201', entitlementServer: 'https://es.example/ts43', useHttpPost: true,
+	transferTypePsim: 2, transferTypeEsim: 3, supportEsimToEsimTransfer: true } ]);
+let eng_esim = (records) => {
+	let e = P.engine({
+		esim: (...a) => esim(...a),
+		card: (ref, args, cb) => cb(null, { mnc_len: '2', group_id: '' }),
+		modem: () => ({ imsi: '262011234567890', iccid: ICCID, imei: '351234567890123', model: 'RG650E',
+		                eid: '89049032000000000000000000012345', profiles: [ { iccid: ICCID + 'F' } ] }),
+		online: () => token, http: (req, cb) => { push(check_reqs, req); cb(null, { status: 403, headers: {}, body: '' }); },
+		timer: (ms, fn) => push(timers, fn), now: () => clock, log: () => null,
+		read: (p) => (p == '/etc/wwand/esim-transfer/entitlement.json') ? records : files[p],
+		write: (p, t) => { files[p] = t; return true; }, state_dir: '/st',
+	});
+	return e;
+};
+check_reqs = [];
+eng = eng_esim(recfile);
+eng.check('m0', P.cfg_of({}), () => null);
+k = eng.status('m0').check;
+eq(k.items[4], { id: 'source', ok: true, detail: 'eSIM profile, transfer type 3' }, 'check: an eSIM source takes the eSIM type');
+ok(index(check_reqs[0]?.body ?? '', '"EAP_ID"') >= 0, 'check: the record\'s useHttpPost (JSON body)');
+
+eng = eng_esim(replace(recfile, 'true }', 'false }'));
+eng.check('m0', P.cfg_of({}), () => null);
+k = eng.status('m0').check;
+eq(k.verdict, 'the operator does not transfer from this kind of SIM', 'check: the record forbids an eSIM source');
+
+// --- the operator list (NekokoLPA2 entitlement.json, fetched on request) ------
+
+let list_doc = sprintf('%J', [
+	{ mccmnc: '26202', carrierName: 'Vodafone', entitlementServer: 'https://es-de.vodafone.com:5445/DEGDROIDInterfaceTS43',
+	  useHttpPost: true, transferTypePsim: 2, transferTypeEsim: 3, supportEsimToEsimTransfer: true, channel: 'google' },
+	{ mccmnc: '26201', carrierName: 'Telekom', entitlementServer: 'https://entitlement.telekom.de:4443', channel: 'samsung' },
+	{ mccmnc: '26201', carrierName: 'broken', entitlementServer: 'http://plain.example' },
+	'not a record',
+]);
+
+eq(map(P.carriers_of(list_doc).records, (r) => r.carrierName), [ 'Vodafone' ],
+	'carriers: Samsung-channel, non-https and non-record entries are dropped');
+eq(P.carriers_of('{}').error, 'not a list of records', 'carriers: not a list');
+eq(P.carriers_of('[{"mccmnc":"26201","entitlementServer":"https://x.example","channel":"samsung"}]').error,
+	'no usable record', 'carriers: nothing usable');
+
+let fetched = [];
+let list_http = (req, cb) => { push(fetched, req.url); cb(null, { status: 200, headers: {}, body: list_doc }); };
+
+reset();
+eng = P.engine({
+	esim: (...a) => esim(...a),
+	card: (ref, args, cb) => cb(null, { mnc_len: '2', group_id: '' }),
+	modem: () => ({ imsi: '262021234567890', iccid: ICCID, imei: '351234567890123', model: 'RG650E',
+	                eid: '89049032000000000000000000012345', profiles: [ { iccid: ICCID } ] }),
+	online: () => token, http: list_http, timer: (ms, fn) => push(timers, fn), now: () => clock, log: () => null,
+	read: (p) => files[p], write: (p, t) => { files[p] = t; return true; }, state_dir: '/st',
+});
+eng.carriers_update('m0', P.cfg_of({}), (e, r) => res = [ e, r ]);
+eq(res[0], null, 'carriers update: no error');
+eq(res[1].count, 1, 'carriers update: the usable records counted');
+ok(match(fetched[0], /^https:\/\/raw\.githubusercontent\.com\/iebb\/NekokoLPA2\/[0-9a-f]{40}\/assets\/ts43\/entitlement\.json$/),
+	'carriers update: from a pinned NekokoLPA2 commit');
+ok(files['/etc/wwand/esim-transfer/carriers.json'] != null, 'carriers update: stored');
+eq(eng.status('m0').carriers.count, 1, 'carriers: in the status');
+
+// the check now finds Vodafone's server in the list, as an eSIM source with type 3
+eng.check('m0', P.cfg_of({}), () => null);
+k = eng.status('m0').check;
+ok(match(k.items[3]?.detail ?? '', /^https:\/\/es-de\.vodafone\.com:5445\/DEGDROIDInterfaceTS43 \(from the operator list \(NekokoLPA2 [0-9a-f]{8}\)\)$/),
+	'check: the server from the fetched list, and says so');
+eq(k.items[4]?.detail, 'eSIM profile, transfer type 3', 'check: the list record\'s eSIM type');
+
+// a user's own entitlement.json wins over the list
+files['/etc/wwand/esim-transfer/entitlement.json'] = sprintf('%J', [ { mccmnc: '26202', entitlementServer: 'https://own.example/ts43' } ]);
+eng.check('m0', P.cfg_of({}), () => null);
+ok(match(eng.status('m0').check.items[3]?.detail ?? '', /^https:\/\/own\.example\/ts43 \(from \/etc\/wwand\/esim-transfer\/entitlement\.json\)$/),
+	'check: the user\'s own file first');
+
+// a failed fetch changes nothing
+let before = files['/etc/wwand/esim-transfer/carriers.json'];
+eng = P.engine({ esim: (...a) => esim(...a), card: (r, a, cb) => cb(null, {}), modem: () => null, online: () => null,
+	http: (req, cb) => cb(null, { status: 404, headers: {}, body: '' }), timer: (ms, fn) => push(timers, fn), now: () => clock,
+	log: () => null, read: (p) => files[p], write: (p, t) => { files[p] = t; return true; }, state_dir: '/st' });
+eng.carriers_update('m0', P.cfg_of({}), (e) => res = e);
+eq(res, { error: 'carriers_fetch', detail: 'HTTP 404' }, 'carriers update: a failed fetch is reported');
+eq(files['/etc/wwand/esim-transfer/carriers.json'], before, 'carriers update: and keeps the old list');
+
+// a list that cannot be written is not reported as stored (HW: no /etc/wwand)
+eng = P.engine({ esim: (...a) => esim(...a), card: (r, a, cb) => cb(null, {}), modem: () => null, online: () => null,
+	http: list_http, timer: (ms, fn) => push(timers, fn), now: () => clock, log: () => null,
+	read: (p) => null, write: (p, t) => false, state_dir: '/st' });
+eng.carriers_update('m0', P.cfg_of({}), (e) => res = e);
+eq(res, { error: 'carriers_write', detail: 'cannot write /etc/wwand/esim-transfer/carriers.json' }, 'carriers update: a failed write is an error');
+eq(eng.status('m0').carriers.count, 0, 'carriers update: and nothing is pretended to be there');
+
+// --- physical SIM -> eSIM on a one-executor modem ------------------------------
+
+// the physical SIM is active; the eUICC sits in slot 2 and only the slot list
+// names its EID. The check finds it, a router transfer targets it, and the
+// install switches to slot 2 before downloading.
+let switched = [];
+let conv_card = { profiles: [] };
+let conv_esim = (ref, op, params, cb) => {
+	if (op == 'profiles')
+		return length(switched) ? cb(null, { profiles: conv_card.profiles }) : cb({ error: 'esim', detail: { error: 'no_esim_backend' } });
+	if (op == 'download') { push(conv_card.profiles, { iccid: '89490000000000000001', state: 'disabled' }); return cb(null, { started: true }); }
+	if (op == 'download_status') return cb(null, { state: 'done' });
+	if (op == 'enable') return cb(null, {});
+	cb({ error: 'invalid_op' });
+};
+let conv_reqs = [];
+let conv_http = (req, cb) => {
+	push(conv_reqs, req);
+	let q = {};
+	for (let kv in split(split(req.url, '?')[1] ?? '', '&')) { let x = split(kv, '='); q[x[0]] = x[1]; }
+	if (q.EAP_ID)
+		return cb(null, { status: 200, headers: {}, body: '<wap-provisioningdoc><characteristic type="TOKEN"><parm name="token" value="T1"/></characteristic></wap-provisioningdoc>' });
+	if (q.operation == 'CheckEligibility')
+		return cb(null, { status: 200, headers: {}, body: '<wap-provisioningdoc><characteristic type="APPLICATION"><parm name="OperationResult" value="1"/><parm name="PrimaryAppEligibility" value="1"/></characteristic></wap-provisioningdoc>' });
+	if (q.operation == 'ManageSubscription' && q.operation_type == '3')
+		return cb(null, { status: 200, headers: {}, body: '<wap-provisioningdoc><characteristic type="APPLICATION"><parm name="OperationResult" value="1"/><parm name="SubscriptionResult" value="2"/><characteristic type="DownloadInfo"><parm name="ProfileActivationCode" value="LPA:1$dp.example$X"/></characteristic></characteristic></wap-provisioningdoc>' });
+	if (q.operation == 'ManageSubscription' && q.operation_type == '4')
+		return cb(null, { status: 200, headers: {}, body: '<wap-provisioningdoc><characteristic type="APPLICATION"><parm name="OperationResult" value="1"/><parm name="SubscriptionResult" value="3"/></characteristic></wap-provisioningdoc>' });
+	cb(null, { status: 200, headers: {}, body: '<wap-provisioningdoc><characteristic type="APPLICATION"><parm name="OperationResult" value="1"/><characteristic type="PrimaryConfiguration"><parm name="ServiceStatus" value="1"/></characteristic></characteristic></wap-provisioningdoc>' });
+};
+let conv_log = [];
+let conv = P.engine({
+	esim: conv_esim,
+	card: (ref, args, cb) => cb(null, { mnc_len: '2', group_id: '' }),
+	modem: () => ({ imsi: '262011234567890', iccid: ICCID, imei: '351234567890123', model: 'RG650E', eid: null, profiles: [] }),
+	online: () => token, http: conv_http, timer: (ms, fn) => fn(), now: () => clock, log: () => null,
+	read: (p) => null, write: (p, t) => true, state_dir: '/st',
+	slots: (ref, cb) => cb(null, { slots: [ { physical: 1, active: true, is_euicc: false },
+	                                       { physical: 2, active: false, is_euicc: true, eid: '89033023426300000000041811587764' } ] }),
+	switch_slot: (ref, phys, cb) => { push(switched, phys); cb(null, { ok: true }); },
+});
+
+conv.check('m0', P.cfg_of({ esim_transfer_server: 'https://es.example/ts43' }), () => null);
+k = conv.status('m0').check;
+eq(k.items[1], { id: 'euicc', ok: true, detail: 'EID 89033023… in slot 2 (not active) — the install switches to it' },
+	'conversion: the check finds the inactive eUICC');
+eq(k.items[4].detail, 'physical SIM, transfer type 0', 'conversion: the source is the physical SIM');
+
+conv.ts43_start('m0', P.cfg_of({ esim_transfer_server: 'https://es.example/ts43' }), { target: 'router' }, (e, r) => res = [ e, r ]);
+eq(res[0], null, 'conversion: a router transfer starts without an active eUICC');
+ok(length(filter(conv_reqs, (q) => index(q.url, 'target_terminal_eid=89033023426300000000041811587764') >= 0)) > 0,
+	'conversion: the inactive eUICC\'s EID is the target');
+eq(conv.status('m0').ts43.state, 'download', 'conversion: an activation code for this router');
+
+conv.ts43_install('m0', (e, r) => res = [ e, r ]);
+eq(res[1], { installing: true, switching_to_slot: 2 }, 'conversion: install says it switches');
+eq(switched, [ 2 ], 'conversion: switched to the eUICC slot before the download');
+eq(conv.status('m0').ts43.state, 'done', 'conversion: downloaded, enabled, reported, active');
+ok(length(filter(conv_reqs, (q) => index(q.url, 'operation_type=4') >= 0 && index(q.url, 'terminal_iccid=89490000000000000001') >= 0)) == 1,
+	'conversion: the new profile (found by the list diff) reported with type 4');
 
 // --- the CLI formatter --------------------------------------------------------
 
