@@ -1,0 +1,21 @@
+{
+	"luci-app-wwand-esim-transfer": {
+		"description": "Grant access to the wwand eSIM transfer page",
+		"read": {
+			"ubus": {
+				"wwand": [
+					"status",
+					"modem_plugin_status",
+					"modem_esim_profiles"
+				]
+			}
+		},
+		"write": {
+			"ubus": {
+				"wwand": [
+					"modem_plugin"
+				]
+			}
+		}
+	}
+}

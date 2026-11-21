@@ -1,0 +1,15 @@
+{
+	"admin/network/wwand-esim-transfer": {
+		"title": "eSIM Transfer",
+		"order": 63,
+		"action": {
+			"type": "view",
+			"path": "wwand/esim_transfer"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-wwand-esim-transfer"
+			]
+		}
+	}
+}

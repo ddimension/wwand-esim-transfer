@@ -1,0 +1,202 @@
+#!/usr/bin/env ucode
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 André Valentin <avalentin@marcant.net>
+// esim-transfer-card: the two card commands wwand-esim-transfer needs that
+// lpac does not offer, spoken over lpac's stdio APDU protocol so that
+// wwand's esim_bridge.session_run relays them over whatever channel the
+// modem has (MBIM UICC, QMI UIM, AT, plain SEND APDU) under the same claim as
+// lpac:
+//
+//   aka <RAND> <AUTN>   USIM AUTHENTICATE, 3G context (3GPP TS 31.102
+//                       7.1.2.1): the answer for an EAP-AKA challenge
+//   profiles            ES10c GetProfilesInfo with the SGP.22 v3 tags
+//                       (deviceChangeConfiguration, BF20; SGP.22 v3.1
+//                       2.4a.1.9), which lpac 2.3.0's `profile list` does not
+//                       ask for
+//
+// The result goes back as ONE host event, {"type":"event","payload":{"event":
+// "card_result", ...}} with flat string fields (esim_bridge event_payload
+// reads only flat strings, booleans and integers); the host's reply ends the
+// run. Exit 0 when the card answered, 1 otherwise.
+//
+// Protocol (lpac src/driver/apdu/stdio.c, 2.3.0; wwand esim_bridge.uc
+// parse_lpac_line): a request is {"type":"apdu","payload":{"func":…,
+// "param":…}}, its answer {"type":"apdu","payload":{"ecode":N,"data":"…"}}.
+
+'use strict';
+
+import * as fs from 'fs';
+
+// the USIM application, by the RID + application code part of its AID
+// (ETSI TS 101 220 annex E: A0000000 87 1002 = 3GPP USIM); a partial AID
+// selects the card's one USIM by DF name (ISO 7816-4 SELECT, first
+// occurrence). Whether every modem's logical-channel open passes a partial
+// AID through is NOT known — measure it on each backend before relying on it.
+const USIM_AID = 'A0000000871002';
+const ISDR_AID = 'A0000005591010FFFFFFFF8900000100';
+
+let send = (o) => { fs.stdout.write(sprintf('%J\n', o)); fs.stdout.flush(); };
+
+// one request/answer round with the host; null when stdin closed
+function host(func, param)
+{
+	send({ type: 'apdu', payload: { func: func, param: param ?? '' } });
+
+	for (;;) {
+		let line = fs.stdin.read('line');
+
+		if (line == null || line == '')
+			return null;
+
+		let m = match(line, /"ecode": *(-?[0-9]+)[^}]*"data": *"([0-9A-Fa-f]*)"/);
+
+		if (m)
+			return { ecode: +m[1], data: uc(m[2]) };
+	}
+}
+
+function finish(fields, code)
+{
+	send({ type: 'event', payload: { event: 'card_result', ...fields } });
+
+	// wait for the host's acknowledgement, then leave
+	fs.stdin.read('line');
+	host('disconnect');
+	exit(code);
+}
+
+let chan = 0;
+
+// The CLA for this channel: lpac keeps the class bits and puts the channel in
+// the low nibble (lpac euicc/euicc.c:17, 2.3.0; ISO 7816-4 5.4.1 for 1..3).
+let cla = (base) => sprintf('%02X', (base & 0xF0) | (chan & 0x0F));
+
+// One command with the T=0 follow-ups a modem's raw APDU path may hand back:
+// 61xx → GET RESPONSE xx, 6Cxx → the same command again with Le = xx (ISO
+// 7816-3 10.3.1 / 7816-4 5.1.3). Returns { data, sw } (hex), null on a
+// transport failure.
+function apdu(hdr_cla, rest)
+{
+	let r = host('transmit', cla(hdr_cla) + rest);
+
+	if (!r || r.ecode < 0 || length(r.data) < 4)
+		return null;
+
+	let out = '';
+
+	for (let n = 0; n < 16; n++) {
+		let sw = substr(r.data, length(r.data) - 4);
+
+		out += substr(r.data, 0, length(r.data) - 4);
+
+		if (substr(sw, 0, 2) == '61')
+			r = host('transmit', cla(hdr_cla) + 'C00000' + substr(sw, 2));
+		else if (substr(sw, 0, 2) == '6C')
+			r = host('transmit', cla(hdr_cla) + substr(rest, 0, length(rest) - 2) + substr(sw, 2));
+		else
+			return { data: out, sw: sw };
+
+		if (!r || r.ecode < 0 || length(r.data) < 4)
+			return null;
+	}
+
+	return null;
+}
+
+function open_channel(aid)
+{
+	let r = host('logic_channel_open', aid);
+
+	if (!r || r.ecode < 0)
+		return false;
+
+	chan = r.ecode;
+
+	return true;
+}
+
+let args = ARGV;
+let cmd = args[0];
+
+if (!host('connect'))
+	exit(1);
+
+if (cmd == 'aka') {
+	let rand = uc(args[1] ?? ''), autn = uc(args[2] ?? '');
+
+	if (!match(rand, /^[0-9A-F]{32}$/) || !match(autn, /^[0-9A-F]{32}$/))
+		finish({ error: 'arguments' }, 1);
+
+	if (!open_channel(USIM_AID))
+		finish({ error: 'usim_channel' }, 1);
+
+	// 00 88 00 81: AUTHENTICATE, P2 = 3G security context, specific
+	// reference data (TS 31.102 7.1.2); Lc 22 = L RAND L AUTN; Le 00
+	let r = apdu(0x00, '88008122' + '10' + rand + '10' + autn + '00');
+
+	host('logic_channel_close');
+
+	if (!r)
+		finish({ error: 'transport' }, 1);
+
+	// 9000 with DB… or DC… in the data; 9862 is "authentication error,
+	// incorrect MAC" (TS 31.102 7.3) — a network that failed to prove itself
+	finish({ response: (r.sw == '9000') ? r.data : '', sw: r.sw }, (r.sw == '9000') ? 0 : 1);
+}
+
+// What the EAP identity and the entitlement record need that the daemon does
+// not know: the MNC length from EF_AD (TS 31.102 4.2.18, byte 4, low
+// nibble: 2 or 3) and GID1 (EF_GID1, 4.2.10). Under the USIM ADF the
+// channel opened, by file id; P2 04 asks for the FCP, which the read does not
+// need but some cards refuse a SELECT without (ETSI TS 102 221 11.1.1).
+if (cmd == 'identity') {
+	if (!open_channel(USIM_AID))
+		finish({ error: 'usim_channel' }, 1);
+
+	let read_ef = (fid) => {
+		let s = apdu(0x00, 'A4000402' + fid + '00');
+
+		if (!s || s.sw != '9000')
+			return null;
+
+		let r = apdu(0x00, 'B0000000');
+
+		return (r && r.sw == '9000') ? r.data : null;
+	};
+
+	let ad = read_ef('6FAD'), gid1 = read_ef('6F3E');
+
+	host('logic_channel_close');
+
+	let mnc_len = (length(ad ?? '') >= 8) ? (hex(substr(ad, 6, 2)) & 0x0F) : null;
+
+	// `group_id`, not `gid1`: the host reads event fields named [a-z_]+ only
+	// (wwand esim_bridge event_payload), and a digit in the name drops the
+	// field without a word — HW-seen on the NR7101, 2026-11-21
+	finish({ mnc_len: (mnc_len in [ 2, 3 ]) ? sprintf('%d', mnc_len) : '', group_id: replace(gid1 ?? '', /F+$/, '') },
+		(mnc_len in [ 2, 3 ]) ? 0 : 1);
+}
+
+if (cmd == 'profiles') {
+	if (!open_channel(ISDR_AID))
+		finish({ error: 'isdr_channel' }, 1);
+
+	// BF2D { 5C taglist }: iccid 5A, profileState 9F70, serviceProviderName
+	// 91, profileName 92, profileNickname 90, deviceChangeConfiguration BF20
+	// (SGP.22 v3.1 ProfileInfoListRequest 5.7.15, ProfileInfo tags)
+	let tags = '5A9F70919290BF20';
+	let req = sprintf('BF2D%02X5C%02X%s', 2 + length(tags) / 2, length(tags) / 2, tags);
+
+	// 80 E2 91 00: STORE DATA, last (only) block (GlobalPlatform 11.11;
+	// SGP.22 5.7.2)
+	let r = apdu(0x80, sprintf('E29100%02X%s', length(req) / 2, req));
+
+	host('logic_channel_close');
+
+	if (!r)
+		finish({ error: 'transport' }, 1);
+
+	finish({ response: r.data, sw: r.sw }, (r.sw == '9000') ? 0 : 1);
+}
+
+finish({ error: 'usage' }, 2);
