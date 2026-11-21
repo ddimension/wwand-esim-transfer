@@ -512,7 +512,8 @@ function engine(deps)
 	// identity (MNC length for the realm, GID1 for the record), the
 	// entitlement server, the session config. cb(err, c, info); info says
 	// what was found, for the pre-flight check's checklist.
-	let prepare = (ref, cfg, target, cb) => {
+	// eu: euicc_of()'s answer, when the caller has it
+	let prepare = (ref, cfg, target, cb, eu) => {
 		let m = deps.modem(ref);
 
 		if (!m?.imsi)
@@ -548,8 +549,12 @@ function engine(deps)
 			// one for a physical SIM and one for an eSIM profile, and an
 			// operator may support only one direction (ts43-go entitlement.go
 			// toEntitlement). The SIM in use is an eSIM profile when its
-			// ICCID is among the eUICC's profiles.
-			let esim_source = length(filter(m.profiles ?? [], (p) => iccid_eq(p.iccid, m.iccid))) > 0;
+			// ICCID is among the eUICC's profiles, or when the modem's slot
+			// list says the eUICC is the active card: the profile list can
+			// lag a slot switch by minutes (empty 90 s after one on the
+			// Chateau, 2026-11-21), the slot list does not. (A bare EID in
+			// status is no such word: it can outlive a switch away.)
+			let esim_source = !!(eu?.from_slots && eu.active) || length(filter(m.profiles ?? [], (p) => iccid_eq(p.iccid, m.iccid))) > 0;
 			let supported = esim_source ? r.supportEsimToEsimTransfer : r.supportPsimToEsimTransfer;
 
 			info.source = esim_source ? 'esim' : 'psim';
@@ -591,8 +596,9 @@ function engine(deps)
 		deps.slots(ref, (err, res) => {
 			let e = filter(res?.slots ?? [], (x) => x.is_euicc && valid_eid(x.eid))[0];
 
+			// from_slots: `active` is the modem's own word, not an inference
 			if (e)
-				return cb({ eid: e.eid, physical: e.physical, active: !!e.active });
+				return cb({ eid: e.eid, physical: e.physical, active: !!e.active, from_slots: true });
 
 			cb(valid_eid(m?.eid) ? { eid: m.eid, physical: null, active: true } : null);
 		});
@@ -637,9 +643,14 @@ function engine(deps)
 		trace(ref, 'ts43', sprintf('transfer requested, target %s%s', target,
 			(target == 'router' && eu && !eu.active) ? sprintf(' (eUICC in slot %d, not active)', eu.physical) : ''));
 
-		prepare(ref, cfg, { eid: teid, imei: timei }, (err, c) => {
+		prepare(ref, cfg, { eid: teid, imei: timei }, (err, c, info) => {
 			if (err)
 				return cb(err);
+
+			// the source already IS a profile of this eUICC: "onto this
+			// router" would order a transfer onto the card it is on
+			if (target == 'router' && info?.source == 'esim')
+				return cb({ error: 'same_card', detail: 'the SIM in use is already a profile on this router\'s eUICC' });
 
 			let t = { state: 'starting', target: target, target_eid: teid, server: c.server, events: [],
 			          started: deps.now(), result: null, prompt: null,
@@ -683,7 +694,7 @@ function engine(deps)
 			t.session = ts43.session(c, fx_of(ref), on);
 			cb(null, { started: true, server: c.server, target: target });
 			t.session.start();
-		});
+		}, eu);
 		});
 	};
 
@@ -777,8 +788,8 @@ function engine(deps)
 				}
 
 				if (ev.state == 'denied') {
-					item('eligible', false, sprintf('%s refused (OperationResult %s%s)', ev.reason,
-						ev.operation_result ?? '-', ev.text ? ', ' + ev.text : ''));
+					item('eligible', false, sprintf('%s refused (OperationResult %s, PrimaryAppEligibility %s%s)', ev.reason,
+						ev.operation_result ?? '-', ev.eligibility ?? '-', ev.text ? ', ' + ev.text : ''));
 					finish('the operator says no for this subscription or device');
 				}
 
@@ -791,7 +802,7 @@ function engine(deps)
 				}
 			});
 			sess.start();
-		});
+		}, eu);
 		});
 	};
 

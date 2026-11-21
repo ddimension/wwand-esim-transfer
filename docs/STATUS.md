@@ -96,6 +96,27 @@ prepaid profile.
 - **Config note:** the Chateau has `option sim_slot '1'`, but slot 2 was
   active. Every wwand restart switches it to slot 1.
 
+## Second Chateau round (2026-11-21, after its firmware update)
+
+- New image r0-6c8f101b: its wwand core already has the modem_esim dep,
+  discovery and notify seq.
+- Installed:
+  - `wwand-lpac-curl` (local SDK build, unsigned, `apk add
+    --allow-untrusted`): static curl 8.21.0 / wolfSSL 5.9.2;
+  - the plugin as bytecode, compiled on the device.
+- Vodafone 262 02 eSIM profile:
+  - login ok;
+  - CheckEligibility `PrimaryAppEligibility=0` (type 3), no other field.
+- Fixes from it:
+  - the source is an eSIM when the slot list says the eUICC is active (the
+    profile list was still empty 90 s after the switch);
+  - the refusal's answer goes into the trace;
+  - the checklist shows PrimaryAppEligibility;
+  - "onto this router" is refused when the source is already one of its
+    profiles.
+- Restored: slot 1 (config sim_slot 1), wwand0 + wwims CONNECTED. The plugin,
+  LuCI page and wwand-lpac-curl stay installed.
+
 ## Open
 
 1. A transfer past CheckEligibility: needs a subscription the operator

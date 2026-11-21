@@ -418,6 +418,24 @@ eng.carriers_update('m0', P.cfg_of({}), (e) => res = e);
 eq(res, { error: 'carriers_write', detail: 'cannot write /etc/wwand/esim-transfer/carriers.json' }, 'carriers update: a failed write is an error');
 eq(eng.status('m0').carriers.count, 0, 'carriers update: and nothing is pretended to be there');
 
+// the eUICC is the active card but the daemon's profile list is still empty
+// (it lags a slot switch): the source is an eSIM all the same
+eng = P.engine({
+	esim: (...a) => esim(...a), card: (ref, args, cb) => cb(null, { mnc_len: '2', group_id: '' }),
+	modem: () => ({ imsi: '262011234567890', iccid: ICCID, imei: '351234567890123', eid: null, profiles: [] }),
+	online: () => token, http: (req, cb) => cb(null, { status: 403, headers: {}, body: '' }),
+	timer: (ms, fn) => push(timers, fn), now: () => clock, log: () => null,
+	read: (p) => (p == '/etc/wwand/esim-transfer/entitlement.json') ? recfile : null, write: (p, t) => true, state_dir: '/st',
+	slots: (ref, cb) => cb(null, { slots: [ { physical: 2, active: true, is_euicc: true, eid: '89033023426300000000041811587764' } ] }),
+});
+eng.check('m0', P.cfg_of({}), () => null);
+eq(eng.status('m0').check.items[4], { id: 'source', ok: true, detail: 'eSIM profile, transfer type 3' },
+	'source: the active eUICC makes it an eSIM even before the profile list is read');
+
+// "onto this router" when the SIM in use already is one of its profiles
+eng.ts43_start('m0', P.cfg_of({}), { target: 'router' }, (e) => res = e);
+eq(res?.error, 'same_card', 'router target: refused when the source is on the same eUICC');
+
 // --- physical SIM -> eSIM on a one-executor modem ------------------------------
 
 // the physical SIM is active; the eUICC sits in slot 2 and only the slot list

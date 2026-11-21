@@ -104,6 +104,24 @@ builds with the same ucode:
 - the card helper against a scripted APDU host;
 - the plugin engine against a fake card.
 
+## What works today
+
+Moving an eSIM between devices with wwand depends on the route, and on the
+operator:
+
+| Route | State (2026-11-21) |
+|---|---|
+| The operator issues a new code, wwand imports it (QR, ePIN → *Import*) | Works with every operator, in both directions. The download is wwand's existing, hardware-proven path. |
+| Release on the router (disable, delete, the delete notification until acknowledged) | Host-tested; not yet run on hardware with a real deletion. |
+| TS.43, router → another device (a code shown as a QR) | Hardware-verified up to CheckEligibility (Telekom, Vodafone DE); ordering, polling and the code are tested against a fake server only. |
+| TS.43, physical SIM → eSIM in the same router | The check is hardware-verified, including finding the eUICC in an inactive slot; the slot switch, download and activation are tested against a fake server only. |
+| Another device → this router by TS.43 | Not possible: the phone's own system runs that transfer, for a phone. The router takes the code route. |
+
+The limit is the operator. It must enable the subscription for a transfer,
+and it must accept the device. Both SIMs tried were refused at
+CheckEligibility, so whether an operator lets an automatic TS.43 transfer
+reach a router is still open.
+
 ## Hardware (2026-11-21)
 
 - **USIM for EAP-AKA:** logical channel by the partial USIM AID, EF_AD,
@@ -111,20 +129,20 @@ builds with the same ucode:
   - NR7101, RG502Q-EA, over **AT** (`AT+CCHO`);
   - Chateau, RG650E-EU, over **QMI UIM**: a physical SIM and an eSIM profile.
 - **Telekom** (`entitlement.telekom.de:4443`, from the operator list):
-  - EAP-AKA accepted with the server's AT_MAC verified;
+  - EAP-AKA accepted, with the server's AT_MAC verified;
   - token;
-  - CheckEligibility answered "not eligible" for that number ("nicht für
-    einen Transfer freigeschaltet").
+  - CheckEligibility refused that number: "nicht für einen Transfer
+    freigeschaltet".
 - **Vodafone DE** (`es-de.vodafone.com:5445`, POST + JSON, behind Imperva):
-  - EAP-AKA accepted once all four cookies came back (curl transport);
+  - EAP-AKA accepted, once all four cookies came back (curl transport);
   - token;
-  - CheckEligibility `PrimaryAppEligibility=0` for a prepaid eSIM profile
-    with the router's own identity.
+  - CheckEligibility for an eSIM prepaid profile (transfer type 3), with the
+    router's own identity: `PrimaryAppEligibility=0`, and nothing else in the
+    answer (no text, no message).
 
 Not yet:
 - a transfer past CheckEligibility;
-- discovery and the release's `notify seq` on an eUICC;
-- physical SIM → eSIM on a one-executor modem (see docs/STATUS.md).
+- discovery and the release's `notify seq` on an eUICC.
 
 ## License
 

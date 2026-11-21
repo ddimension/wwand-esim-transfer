@@ -555,6 +555,7 @@ function session(c, fx, on)
 			}
 
 			st.last = p;
+			st.last_body = res.body;
 			cb(null, p);
 		});
 	};
@@ -569,10 +570,22 @@ function session(c, fx, on)
 		[ 'old_terminal_iccid', c.source_iccid ],
 	];
 
-	let denied = (op, p) => fail('denied', op, {
-		operation_result: p?.app?.OperationResult, subscription_result: p?.app?.SubscriptionResult,
-		text: p?.app?.GeneralErrorText,
-	});
+	// a refusal's answer may say more than the fields the flow reads (an
+	// operator's own parms, a text in another place): its start goes into
+	// the trace, masked
+	let denied = (op, p) => {
+		// from the application on: the head of the document is VERS and
+		// TOKEN, the same in every answer, and would use up the snippet
+		let b = st.last_body ?? '';
+		let at = index(b, 'APPLICATION');
+
+		at = (at < 0) ? index(b, APP_ODSA) : at;
+		fx.log('debug', sprintf('ts43: %s refused, the answer: %s', op, snippet((at > 30) ? substr(b, at - 30) : b)));
+		fail('denied', op, {
+			operation_result: p?.app?.OperationResult, subscription_result: p?.app?.SubscriptionResult,
+			eligibility: p?.app?.PrimaryAppEligibility, text: p?.app?.GeneralErrorText,
+		});
+	};
 
 	let poll, manage, ask;
 

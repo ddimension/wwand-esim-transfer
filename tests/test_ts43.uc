@@ -327,6 +327,15 @@ ok(index(tr, 'ts43: CheckEligibility: OperationResult=1 PrimaryAppEligibility=1'
 ok(index(tr, 'ts43: ManageSubscription: OperationResult=1 SubscriptionResult=3') >= 0, 'trace: the subscription result');
 ok(!match(tr, /262011234567890|tok1/), 'trace: neither the IMSI nor the token appears in full');
 
+// a refusal's answer goes into the trace (Vodafone answers PrimaryAppEligibility
+// 0 with no text; whatever else it sends is the only clue)
+traced = [];
+tr_fx = fx_of(server({ CheckEligibility: app_xml({ OperationResult: '1', PrimaryAppEligibility: '0', VendorHint: 'device-not-supported' }) }, []));
+tr_fx.log = (lvl, msg) => push(traced, msg);
+T.session(cfg(), tr_fx, () => null).start();
+ok(length(filter(traced, (l) => index(l, 'CheckEligibility refused, the answer:') >= 0 && index(l, 'device-not-supported') >= 0)) == 1,
+	'trace: the refused answer\'s body, so an operator\'s own field is seen');
+
 // --- the entitlement record --------------------------------------------------
 
 let recs = [
